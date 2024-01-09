@@ -2,6 +2,7 @@ package com.hmdp.service.impl;
 
 import cn.hutool.core.bean.BeanUtil;
 import cn.hutool.core.util.BooleanUtil;
+import cn.hutool.extra.spring.SpringUtil;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.dto.Result;
 import com.hmdp.entity.VoucherOrder;
@@ -42,6 +43,8 @@ import java.util.concurrent.Executors;
 @Service
 public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, VoucherOrder> implements IVoucherOrderService {
 
+    private final String queueName = "stream.orders";
+
     @Resource
     private ISeckillVoucherService seckillVoucherService;
 
@@ -65,19 +68,41 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     private static final ExecutorService SECKILL_ORDER_EXECUTOR = Executors.newSingleThreadExecutor();
 
     @PostConstruct
-    private void init(){
+    private void init() {
+
+        // 0.初始化stream
+        initStream();
+
         // TODO 需要秒杀下单功能的同学自己解开下面的注释
         SECKILL_ORDER_EXECUTOR.submit(new VoucherOrderHandler());
     }
 
-    private class VoucherOrderHandler implements Runnable{
-        private final String queueName = "stream.orders";
+    public void initStream() {
+        Boolean exists = stringRedisTemplate.hasKey(queueName);
+        if (BooleanUtil.isFalse(exists)) {
+            log.info("stream不存在，开始创建stream");
+            // 不存在，需要创建
+            stringRedisTemplate.opsForStream().createGroup(queueName, ReadOffset.latest(), "g1");
+            log.info("stream和group创建完毕");
+            return;
+        }
+        // stream存在，判断group是否存在
+        StreamInfo.XInfoGroups groups = stringRedisTemplate.opsForStream().groups(queueName);
+        if (groups.isEmpty()) {
+            log.info("group不存在，开始创建group");
+            // group不存在，创建group
+            stringRedisTemplate.opsForStream().createGroup(queueName, ReadOffset.latest(), "g1");
+            log.info("group创建完毕");
+        }
+    }
+
+    private class VoucherOrderHandler implements Runnable {
+
         @Override
         public void run() {
             while (true) {
                 try {
-                    // 0.初始化stream
-                    initStream();
+
                     // 1.获取消息队列中的订单信息 XREADGROUP GROUP g1 c1 COUNT 1 BLOCK 2000 STREAMS s1 >
                     List<MapRecord<String, Object, Object>> list = stringRedisTemplate.opsForStream().read(
                             Consumer.from("g1", "c1"),
@@ -93,35 +118,21 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                     MapRecord<String, Object, Object> record = list.get(0);
                     Map<Object, Object> value = record.getValue();
                     VoucherOrder voucherOrder = BeanUtil.fillBeanWithMap(value, new VoucherOrder(), true);
+
                     // 3.创建订单
                     handleVoucherOrder(voucherOrder);
                     // 4.确认消息 XACK stream.orders g1 id
                     stringRedisTemplate.opsForStream().acknowledge(queueName, "g1", record.getId());
                 } catch (Exception e) {
                     log.error("处理订单异常", e);
+
+                    // 处理失败情况， pendingList当中找数据
                     handlePendingList();
+
                 }
             }
         }
 
-        public void initStream(){
-            Boolean exists = stringRedisTemplate.hasKey(queueName);
-            if (BooleanUtil.isFalse(exists)) {
-                log.info("stream不存在，开始创建stream");
-                // 不存在，需要创建
-                stringRedisTemplate.opsForStream().createGroup(queueName, ReadOffset.latest(), "g1");
-                log.info("stream和group创建完毕");
-                return;
-            }
-            // stream存在，判断group是否存在
-            StreamInfo.XInfoGroups groups = stringRedisTemplate.opsForStream().groups(queueName);
-            if(groups.isEmpty()){
-                log.info("group不存在，开始创建group");
-                // group不存在，创建group
-                stringRedisTemplate.opsForStream().createGroup(queueName, ReadOffset.latest(), "g1");
-                log.info("group创建完毕");
-            }
-        }
 
         private void handlePendingList() {
             while (true) {
@@ -153,37 +164,43 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     }
 
     private void handleVoucherOrder(VoucherOrder voucherOrder) {
+
         Long userId = voucherOrder.getId();
+
         // 创建锁对象
         // SimpleRedisLock lock = new SimpleRedisLock("order:" + userId, stringRedisTemplate);
         RLock lock = redissonClient.getLock("lock:order:" + userId);
+
         // 获取锁
         boolean isLock = lock.tryLock();
         // 判断是否获取锁成功
-        if(!isLock){
+        if (!isLock) {
             // 获取锁失败，返回错误或重试
             log.error("不允许重复下单");
             return;
         }
         try {
             // 获取代理对象（事务）
-            createVoucherOrder(voucherOrder);
+            SpringUtil.getBean(IVoucherOrderService.class).createVoucherOrder(voucherOrder);
         } finally {
             // 释放锁
             lock.unlock();
         }
     }
 
-    IVoucherOrderService proxy;
+//    IVoucherOrderService proxy;
+
     @Override
     public Result seckillVoucher(Long voucherId) {
+
+        // 获取用户Id
         Long userId = UserHolder.getUser().getId();
+
+        // 生成订单ID
         long orderId = redisIdWorker.nextId("order");
-        // 1.执行lua脚本
-        Long result = stringRedisTemplate.execute(
-                SECKILL_SCRIPT,
-                Collections.emptyList(),
-                voucherId.toString(), userId.toString(), String.valueOf(orderId)
+
+        // 1.执行lua脚本,原子性操作
+        Long result = stringRedisTemplate.execute(SECKILL_SCRIPT, Collections.emptyList(), voucherId.toString(), userId.toString(), String.valueOf(orderId)
         );
         int r = result.intValue();
         // 2.判断结果是否为0
@@ -192,18 +209,20 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             return Result.fail(r == 1 ? "库存不足" : "不能重复下单");
         }
         // 3.获取代理对象
-        proxy = (IVoucherOrderService) AopContext.currentProxy();
+//        proxy = (IVoucherOrderService) AopContext.currentProxy();
         // 4.返回订单id
         return Result.ok(orderId);
     }
 
-    @Transactional
+    @Transactional(rollbackFor = Exception.class)
     public void createVoucherOrder(VoucherOrder voucherOrder) {
+
         // 5.一人一单
         Long userId = voucherOrder.getUserId();
 
         // 5.1.查询订单
         int count = query().eq("user_id", userId).eq("voucher_id", voucherOrder.getVoucherId()).count();
+
         // 5.2.判断是否存在
         if (count > 0) {
             // 用户已经购买过了
